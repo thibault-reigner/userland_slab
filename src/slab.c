@@ -11,109 +11,205 @@
 #include "queue.h"
 
 
+#define ROUNDUP(x,align) ({ ((x/align) + (x % align ? 1UL : 0UL))*align;})
+#define ROUNDDOWN(x, align) ({ (x/align)*align;})
 
+
+static struct Obj * initialize_page_free_objs_list(void *pg,
+						   size_t pg_sz,
+						   struct Obj *first_obj,
+						   size_t obj_sz);
+static struct Userland_slab * create_slab(unsigned int pgs_per_slab,
+					  size_t pg_sz,
+					  size_t actual_obj_sz,
+					  struct Objs_cache *cache_slab_descr);
+static void destroy_slab(struct Userland_slab *slab, size_t slab_sz);
+static void * alloc_obj_from_slab(struct Userland_slab *slab);
+static void free_obj_from_slab(struct Userland_slab *slab, struct Obj *obj);
+static struct Userland_slab * get_owning_slab(void *obj, size_t pg_sz);
+
+/*******************************************************
+                        Private data
+*******************************************************/
+
+/* The following cache cache_Userland_slab is used internly to allocate
+   the objects Userland_slab each time a new slab has to be created for
+   an objects cache which do not require the Userland_slab structures to
+   be contained by the new slab itself.
+
+   To break the recursivity induces by the case where we have to 
+   allocate a new slab for the cache cache_Userland_slab, its slabs will
+   contains their descriptors (SLAB_DESCR_ON_SLAB).
+*/
+
+#define CACHE_USERLAND_SLAB_PAGES_PER_SLAB 1 
+
+//cache used to allocate Userland_slab objects
+static struct Objs_cache cache_Userland_slab;
 
 
 /********************************************************
  *                       Private methods
  *******************************************************/
 
+static struct Userland_slab * get_owning_slab(void *obj, size_t pg_sz)
+{
+  return *((struct Userland_slab**)ROUNDDOWN((uintptr_t)obj, pg_sz)); 
+}
+
+/* Initialize the linked list of free objects of a given page.
+ * The first free objects in the page (all the following
+ * objects are assumed to be free too) is given as parameter
+ * first_obj.
+ * Return the last object of the linked list of free
+ * objects.
+ */
+static struct Obj* initialize_page_free_objs_list(void *pg,
+						  size_t pg_size,
+						  struct Obj *first_obj,
+						  size_t obj_size)
+{
+
+  assert(pg != NULL);
+  assert(first_obj != NULL);
+  assert((uintptr_t)pg <= (uintptr_t)first_obj);
+  assert((uintptr_t)first_obj - (uintptr_t)pg <= pg_size);
+  
+  struct Obj *current_obj = first_obj;
+  struct Obj *next_obj    = first_obj;
+
+  while ((uintptr_t)next_obj + obj_size - (uintptr_t)pg <= pg_size) {
+    next_obj = (struct Obj*)((uintptr_t)current_obj + obj_size);
+    current_obj->header.if_free.next = next_obj;
+
+    if ((uintptr_t)next_obj + obj_size - (uintptr_t)pg <= pg_size)
+      current_obj = next_obj;
+  }
+  
+  current_obj->header.if_free.next = NULL;
+
+  return current_obj;
+}
 
 /* Create a new slab to be added to a cache.
- * pages_per_slab : the number of pages used by this slab
- * actual_obj_size : the size occupied by the object and its header
- * slab_descr_cache : if non null, the cache from where to allocate the slab descriptor
+ * pgs_per_slab : the number of pages used by this slab
+ * pg_sz : the size in bytes of a page
+ * obj_sz : (actual) size of an object
+ * cache_slab_descr : if non null, the cache from where to allocate the slab descriptor
  * instead of storing it at the beginning of the slab.
  * Return this adress of the new slab's descriptor if successful, NULL otherwise
  */
-static struct Userland_slab *create_slab(unsigned int pages_per_slab,
-					 size_t actual_obj_size,
-					 struct Objs_cache *slab_descr_cache)
+static struct Userland_slab *create_slab(unsigned int pgs_per_slab,
+					 size_t pg_sz,
+					 size_t obj_sz,
+					 struct Objs_cache *cache_slab_descr)
 {
-  //TODO : Handle the case slab_descr_cache != NULL (slab descriptors are not on-slabs)
+  assert(pgs_per_slab > 0);
+
+  size_t pg_metadata_sz = sizeof(struct Userland_slab *);
+  int on_slab_descriptor = (cache_slab_descr == NULL);
   
-  struct Userland_slab *new_slab = NULL;
-  size_t slab_size = pages_per_slab*sysconf(_SC_PAGESIZE);
+  struct Userland_slab *new_slab_descr = NULL;
+  size_t slab_sz = pgs_per_slab*pg_sz;
 
-  assert((slab_size - sizeof(struct Userland_slab)) / actual_obj_size > 0);
-  
-  if(slab_descr_cache == NULL)
-    {
-      //the slab descriptor is on-slab
-      
-      new_slab = mmap(NULL,
-		      slab_size,
-		      PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS,
-		      -1,
-		      0);
-      //TODO : check if clearing the slab is necessary
-      memset(new_slab, 0, slab_size);
-      
-      if(new_slab != MAP_FAILED)
-	{
-	  new_slab->free_objs_count = (slab_size - sizeof(struct Userland_slab)) / actual_obj_size;
-	  //new_slab->wasted_memory   = (slab_size - sizeof(struct Userland_slab)) % actual_obj_size;
 
-	  //the first object is right after the slab descriptor	  
-	  new_slab->objs = (struct Obj_header*)((uintptr_t)new_slab + sizeof(struct Userland_slab));
-	  new_slab->first_free_obj = new_slab->objs;
+  void *new_slab_pgs = mmap(NULL,
+			    slab_sz,
+			    PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS,
+			    -1,
+			    0);
 
-	  new_slab->prev = NULL;
-	  new_slab->next = NULL;
+  if (new_slab_pgs == MAP_FAILED)
+    return NULL;
 
-	  //now we initialize the headers of each object in the slab
-	  struct Obj_header *current_obj = new_slab->objs;
-	  struct Obj_header *next_obj = NULL;
-	  for(int i=1; i < new_slab->free_objs_count;i++)
-	    {
-	      next_obj = (struct Obj_header*)((uintptr_t)current_obj + actual_obj_size);
-	      current_obj->header.if_free.next = next_obj;
-	      current_obj = next_obj;
-	    }
-	  current_obj->header.if_free.next = NULL;
-	}
+  if (!on_slab_descriptor) {
+    //off-slab slab descriptor
+    new_slab_descr = objs_cache_alloc(cache_slab_descr);
+
+    if (new_slab_descr == NULL) {
+      munmap(new_slab_pgs, slab_sz);
+      return NULL;
     }
-  else{
-    printf("Off-slab allocation of slab descriptor not implemented !\n");
-    exit(-1);
   }
-  return new_slab;
+  else {
+    //on-slab slab descriptor
+    //the slab descriptor is on the first page of the slab
+    new_slab_descr = (struct Userland_slab*)((uintptr_t)new_slab_pgs + pg_metadata_sz);
+  }
+
+  new_slab_descr->pages = new_slab_pgs;
+  
+  //TODO : check if clearing the slab is necessary
+  memset(new_slab_pgs, 0, slab_sz);
+  
+  //At the beginning of each page we define a pointer to the slab descriptor to which this page belongs
+  struct Userland_slab **ptr = new_slab_pgs;
+  for (unsigned int i = 0; i < pgs_per_slab; i++) {
+    *ptr = new_slab_descr;
+    ptr = (struct Userland_slab **)((uintptr_t)ptr + pg_sz);
+  }
+  
+  unsigned int free_objs_first_pg = (pg_sz - pg_metadata_sz - (on_slab_descriptor ? sizeof(struct Userland_slab) : 0)) / obj_sz;
+  unsigned int free_objs_pg = (pg_sz - pg_metadata_sz) / obj_sz;
+
+  new_slab_descr->free_objs_count = free_objs_first_pg + (pgs_per_slab - 1) * free_objs_pg;
+
+  new_slab_descr->first_free_obj = (struct Obj*)((uintptr_t)new_slab_pgs + pg_metadata_sz + (on_slab_descriptor ? sizeof(struct Userland_slab) : 0));
+  new_slab_descr->objs = new_slab_descr->first_free_obj;
+
+  
+  //we set up the linked list of free objects
+
+  struct Obj *current_obj = new_slab_descr->first_free_obj;
+  struct Obj *last_obj = NULL;
+  
+  void *pg = new_slab_pgs;
+  
+  for (unsigned int i = 1; i <= pgs_per_slab; i++) {
+    last_obj = initialize_page_free_objs_list(pg,
+					      pg_sz,
+					      current_obj,
+					      obj_sz);
+    if (i < pgs_per_slab) {
+      pg = (void*)((uintptr_t)pg + pg_sz);
+      current_obj = (struct Obj*)((uintptr_t)pg + pg_metadata_sz);
+      last_obj->header.if_free.next = current_obj;
+    }
+  }
+
+  return new_slab_descr;
 }
 
-static void destroy_slab(struct Userland_slab *slab, size_t slab_size)
+static void destroy_slab(struct Userland_slab *slab, size_t slab_sz)
 {
   assert(slab != NULL);
-  munmap(slab, slab_size);
+  munmap(slab, slab_sz);
 }
 
 
 static void *alloc_obj_from_slab(struct Userland_slab *slab)
 {
-  void *obj_data = NULL;
-
   assert(slab != NULL);
   assert(slab->first_free_obj != NULL);
   
   assert(slab->free_objs_count > 0);
 	  
-  struct Obj_header *obj =slab->first_free_obj;
-  obj_data = (void*)((uintptr_t)obj + sizeof(struct Obj_header));
+  struct Obj *obj =slab->first_free_obj;
 
   slab->free_objs_count--;
       
   //remove this object from the list of free objects
   slab->first_free_obj = obj->header.if_free.next;
-  //we note the slab who owns this object
-  obj->header.if_used.slab = slab;	
+  obj->header.if_free.next = NULL;
 
-  return obj_data; 
+  return obj; 
 }
 
-static void free_obj_from_slab(struct Obj_header *obj)
+static void free_obj_from_slab(struct Userland_slab *slab, struct Obj *obj)
 {
+  assert(slab != NULL);
   assert(obj != NULL);
-  struct Userland_slab *slab = obj->header.if_used.slab;
 
   slab->free_objs_count++;
   obj->header.if_free.next = slab->first_free_obj;
@@ -125,225 +221,250 @@ static void free_obj_from_slab(struct Obj_header *obj)
  *                       Public methods
  *******************************************************/
 
+
+int slab_allocator_init(void)
+{
+  struct Objs_cache *ptr = _objs_cache_init(&cache_Userland_slab,
+					    sizeof(struct Userland_slab),
+					    CACHE_USERLAND_SLAB_PAGES_PER_SLAB,
+					    SLAB_DESCR_ON_SLAB);
+  return (ptr != NULL);
+}
+
+void slab_allocator_destroy(void)
+{
+  objs_cache_destroy(&cache_Userland_slab);
+}
+
 /* Initialize a cache
  *
  *
  * Return cache on success, NULL otherwise
  */
-struct Objs_cache *objs_cache_init(struct Objs_cache *cache,
-				  size_t obj_size,
-				  uint32_t pages_per_slab,
-				  unsigned int slab_descr_on_slab)
+struct Objs_cache * objs_cache_init(struct Objs_cache *cache,
+				    size_t obj_size,
+				    unsigned int pages_per_slab)
+{
+  return _objs_cache_init(cache,
+			  obj_size,
+			  pages_per_slab,
+			  0);
+}
+
+struct Objs_cache * _objs_cache_init(struct Objs_cache *cache,
+				     size_t obj_size,
+				     unsigned int pages_per_slab,
+				     unsigned int flags)
 {
 
-  if(cache != NULL)
-    {
-      cache->obj_size = obj_size;
-      cache->flags.slab_descr_on_slab = slab_descr_on_slab;
-      cache->pages_per_slab = pages_per_slab;
-      cache->slab_size = pages_per_slab*sysconf(_SC_PAGESIZE);
-      cache->free_objs_count = 0;
-      cache->used_objs_count = 0;
-      cache->slab_count = 0;
-      cache->free_slabs_count = 0;
-      cache->partial_slabs_count = 0;
-      cache->full_slabs_count = 0;
-      cache->free_slabs = NULL;
-      cache->partial_slabs = NULL;
-      cache->full_slabs = NULL;
-      cache->slab_descr_cache = NULL;
-      
-      if(slab_descr_on_slab)
-	{
-	  cache->actual_obj_size = obj_size + sizeof(struct Obj_header);
-	  cache->wasted_memory_per_slab = (cache->slab_size - sizeof(struct Userland_slab)) % cache->actual_obj_size;
-	  if((cache->slab_size - sizeof(struct Userland_slab)) / cache->actual_obj_size > 0)
-	    {
-	      cache->objs_per_slab = (cache->slab_size - sizeof(struct Userland_slab)) / cache->actual_obj_size;
-	    }
-	  else{
-	    printf("The slab can't store at least one object ! (i.e : need more pages per slab)\n");
-	    return NULL;
-	  }
-	}
-      else{
-	printf("Slab descriptor off-slab not implemented !\n");
-	return NULL;
-      }
-    }
-  else{
+  if (cache == NULL)
     return NULL;
-  }
+  if (pages_per_slab == 0)
+    return NULL;
+  
+  cache->obj_size = obj_size;
+
+  cache->actual_obj_size = (obj_size >= sizeof(void*) ? obj_size : sizeof(void*));
+
+  cache->flags = flags;
+
+  cache->cache_slab_descr = &cache_Userland_slab;
+      
+  cache->pages_per_slab = pages_per_slab;
+  cache->page_size = sysconf(_SC_PAGESIZE);
+  cache->slab_size = cache->pages_per_slab*cache->page_size;
+
+  size_t pg_metadata_sz = sizeof(void*);
+  unsigned int free_objs_first_pg = (cache->page_size - pg_metadata_sz - (flags & SLAB_DESCR_ON_SLAB ? sizeof(struct Userland_slab) : 0)) / cache->actual_obj_size;
+  unsigned int free_objs_pg = (cache->page_size - pg_metadata_sz) / cache->actual_obj_size;
+  
+  cache->objs_per_slab = free_objs_pg + free_objs_first_pg * (cache->pages_per_slab - 1);;
+
+  cache->wasted_memory_per_page = cache->page_size % cache->actual_obj_size;
+  cache->wasted_memory_per_slab = cache->wasted_memory_per_page * cache->pages_per_slab;
+
+  cache->free_objs_count = 0;
+  cache->used_objs_count = 0;
+  
+  cache->slab_count = 0;
+  cache->free_slabs_count = 0;
+  cache->partial_slabs_count = 0;
+  cache->full_slabs_count = 0;
+      
+  cache->free_slabs = NULL;
+  cache->partial_slabs = NULL;
+  cache->full_slabs = NULL;
 
   return cache;
 }
 
 void objs_cache_destroy(struct Objs_cache *cache)
 {
-  if(cache != NULL)
-    {
-      struct Userland_slab *current, *next;
+  if (cache != NULL) {
+    struct Userland_slab *current, *next;
 
-      current = cache->free_slabs;
-      while(current != NULL)
-	{
-	  next = current->next;
-	  destroy_slab(current, cache->slab_size);
-	  current = next;
-	}
-      
-      current = cache->partial_slabs;
-      while(current != NULL)
-	{
-	  next = current->next;
-	  destroy_slab(current, cache->slab_size);
-	  current = next;
-	}
-      
-      current = cache->full_slabs;
-      while(current != NULL)
-	{
-	  next = current->next;
-	  destroy_slab(current, cache->slab_size);
-	  current = next;
-	}
+    current = cache->free_slabs;
+    while (current != NULL) {
+      next = current->next;
+      destroy_slab(current, cache->slab_size);
+      current = next;
     }
+      
+    current = cache->partial_slabs;
+    while (current != NULL) {
+      next = current->next;
+      destroy_slab(current, cache->slab_size);
+      current = next;
+    }
+      
+    current = cache->full_slabs;
+    while (current != NULL) {
+      next = current->next;
+      destroy_slab(current, cache->slab_size);
+      current = next;
+    }
+  }
 }
 			
 void *objs_cache_alloc(struct Objs_cache *cache)
 {
   void *allocated_obj = NULL;
 
-  if(cache != NULL)
-    {
-      //we try to allocate a new object from a partially used slab
-      if( !dlist_is_empty_generic(cache->partial_slabs) )
-	{
-	  struct Userland_slab *slab = cache->partial_slabs;
+  if (cache != NULL) {
+    //we try to allocate a new object from a partially used slab
+    if ( !dlist_is_empty_generic(cache->partial_slabs)) {
+      struct Userland_slab *slab = cache->partial_slabs;
 	  
-	  allocated_obj = alloc_obj_from_slab(slab);
+      allocated_obj = alloc_obj_from_slab(slab);
 	  
-	  assert(allocated_obj != NULL);
+      assert(allocated_obj != NULL);
 	  
-	  cache->free_objs_count--;
-	  cache->used_objs_count++;
+      cache->free_objs_count--;
+      cache->used_objs_count++;
 	  
-	  if(is_slab_full(slab))
-	    {
-	      //the slab is now full
+      if (is_slab_full(slab)) {
+	//the slab is now full
 	      
-	      dlist_delete_head_generic(cache->partial_slabs, slab, prev, next);
-	      dlist_push_head_generic(cache->full_slabs, slab, prev, next);
+	dlist_delete_head_generic(cache->partial_slabs, slab, prev, next);
+	dlist_push_head_generic(cache->full_slabs, slab, prev, next);
 
-	      cache->partial_slabs_count--;
-	      cache->full_slabs_count++;
-	    }
+	cache->partial_slabs_count--;
+	cache->full_slabs_count++;
+      }
 	    
+    }
+    else {
+      //we try to allocate a new object from a free slab
+	
+      //do we need to create a new free slab first ?
+      if (dlist_is_empty_generic(cache->free_slabs)) {	  
+	if (cache->flags & SLAB_DESCR_ON_SLAB) {
+	  cache->free_slabs = create_slab(cache->pages_per_slab,
+					  cache->page_size,
+					  cache->actual_obj_size,
+					  NULL);
 	}
-      else{
-	//we try to allocate a new object from a free slab
-
-	//do we need to create a new free slab first ?
-	if(dlist_is_empty_generic(cache->free_slabs))
-	  {
-	    cache->free_slabs = create_slab(cache->pages_per_slab, cache->actual_obj_size, cache->slab_descr_cache);
-
-	    assert(cache->free_slabs != NULL);
-	    
-	    cache->free_slabs_count++;
-	    cache->slab_count++;
-
-	    cache->free_objs_count += cache->objs_per_slab;
-	  }
-
-	struct Userland_slab *slab = cache->free_slabs;
-
-	allocated_obj = alloc_obj_from_slab(slab);
-
-	assert(allocated_obj != NULL);
-
-	cache->free_objs_count--;
-	cache->used_objs_count++;
-
-	if(!is_slab_full(slab))
-	  {
-	    //the slab is at least partially used but not full
-	    
-	    dlist_delete_head_generic(cache->free_slabs, slab, prev, next);
-	    dlist_push_head_generic(cache->partial_slabs, slab, prev, next);
-
-	    cache->free_slabs_count--;
-	    cache->partial_slabs_count++;
-	  }
 	else {
-	  //NB : this case only occurs when a slab can contain only one object
-	  
-	  dlist_delete_head_generic(cache->free_slabs, slab, prev, next);
-	  dlist_push_head_generic(cache->full_slabs, slab, prev, next);
-
-	  cache->free_slabs_count--;
-	  cache->full_slabs_count++;
+	  cache->free_slabs = create_slab(cache->pages_per_slab,
+					  cache->page_size,
+					  cache->actual_obj_size,
+					  cache->cache_slab_descr);
 	}
+	    
+	assert(cache->free_slabs != NULL);
+	    
+	cache->free_slabs_count++;
+	cache->slab_count++;
+
+	cache->free_objs_count += cache->objs_per_slab;
+      }
+
+      struct Userland_slab *slab = cache->free_slabs;
+
+      allocated_obj = alloc_obj_from_slab(slab);
+
+      if (allocated_obj == NULL) {
+	printf("Failed to allocate an object in %s (slab corrupted) !\n", __func__);
+	return NULL;
+      }
+      
+      cache->free_objs_count--;
+      cache->used_objs_count++;
+
+      if (!is_slab_full(slab)) {
+	//the slab is at least partially used but not full
+	    
+	dlist_delete_head_generic(cache->free_slabs, slab, prev, next);
+	dlist_push_head_generic(cache->partial_slabs, slab, prev, next);
+
+	cache->free_slabs_count--;
+	cache->partial_slabs_count++;
+      }
+      else {
+	//NB : this case only occurs when a slab can contain only one object
+	  
+	dlist_delete_head_generic(cache->free_slabs, slab, prev, next);
+	dlist_push_head_generic(cache->full_slabs, slab, prev, next);
+
+	cache->free_slabs_count--;
+	cache->full_slabs_count++;
       }
     }
+  }
   
   return allocated_obj;
 }
 
 void objs_cache_free(struct Objs_cache *cache, void *obj)
 {
-  if(cache != NULL)
-    {
-      if(obj != NULL)
-	{
-	  struct Obj_header *obj_h = (struct Obj_header*)((uintptr_t)obj - sizeof(struct Obj_header));
-	  struct Userland_slab *slab = obj_h->header.if_used.slab;
+  
+  if (cache != NULL) {
+    if (obj != NULL) {
+      struct Userland_slab *slab = get_owning_slab(obj, cache->page_size);
 
-	  assert(slab != NULL);
+      if (slab == NULL) {
+	printf("Failed to free an object in %s (slab corrupted) !\n", __func__);
+      }
 
-	  char slab_was_full = is_slab_full(slab);
-	  free_obj_from_slab(obj_h);
-	  char slab_is_now_free = is_slab_empty(slab, cache->objs_per_slab);
+      char slab_was_full = is_slab_full(slab);
+      free_obj_from_slab(slab, obj);
+      char slab_is_now_free = is_slab_empty(slab, cache->objs_per_slab);
 
-	  cache->free_objs_count++;
-	  cache->used_objs_count--;
+      cache->free_objs_count++;
+      cache->used_objs_count--;
 	  
-	  /*We have 3 possible change of state for the slab :
-	    full    -> partial
-	    full    -> free (case where a slab contains 1 object)
-	    partial -> free
-	  */
+      /*We have 3 possible change of state for the slab :
+	full    -> partial
+	full    -> free (case where a slab contains 1 object)
+	partial -> free
+      */
 
-	  if(!slab_was_full &&
-	     slab_is_now_free)
-	    {
-	      //partial -> free
-	      dlist_delete_el_generic(cache->partial_slabs, slab, prev, next);
-	      dlist_push_head_generic(cache->free_slabs, slab, prev, next);
-	      cache->partial_slabs_count--;
-	      cache->free_slabs_count++;
-	    }
-	  else if(slab_was_full)
-	    {
-	      if(!slab_is_now_free)
-		{
-		  //full -> partial
-		  dlist_delete_el_generic(cache->full_slabs, slab, prev, next);
-		  dlist_push_head_generic(cache->partial_slabs, slab, prev, next);
-		  cache->full_slabs_count--;
-		  cache->partial_slabs_count++;
-		}
-	      else{
-		//full -> free
-		dlist_delete_el_generic(cache->full_slabs, slab, prev, next);
-		dlist_push_head_generic(cache->free_slabs, slab, prev, next);
-		cache->full_slabs_count--;
-		cache->free_slabs_count++;
-	      }
-	    } 
+      if ( !slab_was_full && slab_is_now_free) {
+	//partial -> free
+	dlist_delete_el_generic(cache->partial_slabs, slab, prev, next);
+	dlist_push_head_generic(cache->free_slabs, slab, prev, next);
+	cache->partial_slabs_count--;
+	cache->free_slabs_count++;
+      }
+      else if (slab_was_full) {
+	if ( !slab_is_now_free) {
+	  //full -> partial
+	  dlist_delete_el_generic(cache->full_slabs, slab, prev, next);
+	  dlist_push_head_generic(cache->partial_slabs, slab, prev, next);
+	  cache->full_slabs_count--;
+	  cache->partial_slabs_count++;
 	}
+	else {
+	  //full -> free
+	  dlist_delete_el_generic(cache->full_slabs, slab, prev, next);
+	  dlist_push_head_generic(cache->free_slabs, slab, prev, next);
+	  cache->full_slabs_count--;
+	  cache->free_slabs_count++;
+	}
+      } 
     }
-  else{
+  }
+  else {
     printf("Error : cache NULL as parameter for %s\n", __func__);
     exit(-1);
   }
@@ -358,7 +479,7 @@ void display_cache_info(const struct Objs_cache *cache)
   printf("\ndisplay_cache_info()\n" \
 	 "obj_size : %lu\n" \
 	 "actual_obj_size : %lu\n" \
-	 "slab_descr_on_slab : %u\n" \
+	 "flags : %u\n" \
 	 "pages_per_slab : %u\n" \
 	 "slab_size : %lu\n" \
 	 "objs_per_slab : %u\n" \
@@ -371,7 +492,7 @@ void display_cache_info(const struct Objs_cache *cache)
 	 "full_slabs_count : %u\n",
 	 cache->obj_size,
 	 cache->actual_obj_size,
-	 cache->flags.slab_descr_on_slab,
+	 cache->flags,
 	 cache->pages_per_slab,
 	 cache->slab_size,
 	 cache->objs_per_slab,
@@ -392,8 +513,3 @@ void display_slab_info(const struct Userland_slab *slab)
   printf("\n");
 }
 
-struct Userland_slab *get_owning_slab(void *obj)
-{
-  struct Obj_header *obj_h = (struct Obj_header *)((uintptr_t)obj - sizeof(struct Obj_header));
-  return obj_h->header.if_used.slab;
-}
