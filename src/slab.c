@@ -227,7 +227,8 @@ int slab_allocator_init(void)
   struct Objs_cache *ptr = _objs_cache_init(&cache_Userland_slab,
 					    sizeof(struct Userland_slab),
 					    CACHE_USERLAND_SLAB_PAGES_PER_SLAB,
-					    SLAB_DESCR_ON_SLAB);
+					    SLAB_DESCR_ON_SLAB,
+					    NULL);
   return (ptr != NULL);
 }
 
@@ -243,31 +244,31 @@ void slab_allocator_destroy(void)
  */
 struct Objs_cache * objs_cache_init(struct Objs_cache *cache,
 				    size_t obj_size,
-				    unsigned int pages_per_slab)
+				    void (*ctor)(void *))
 {
   return _objs_cache_init(cache,
 			  obj_size,
-			  pages_per_slab,
-			  0);
+			  1,
+			  0,
+			  ctor);
 }
 
 struct Objs_cache * _objs_cache_init(struct Objs_cache *cache,
 				     size_t obj_size,
 				     unsigned int pages_per_slab,
-				     unsigned int flags)
+				     unsigned int flags,
+				     void (*ctor)(void *))
 {
 
-  if (cache == NULL)
-    return NULL;
-  if (pages_per_slab == 0)
+  if (cache == NULL || pages_per_slab == 0)
     return NULL;
   
   cache->obj_size = obj_size;
-
+  //when an object is free, its bytes are used as a pointer to the next free object
+  //so an object has to be at least the big enough to store this pointer
   cache->actual_obj_size = (obj_size >= sizeof(void*) ? obj_size : sizeof(void*));
-
   cache->flags = flags;
-
+  cache->ctor = ctor;
   cache->cache_slab_descr = &cache_Userland_slab;
       
   cache->pages_per_slab = pages_per_slab;
@@ -411,6 +412,9 @@ void *objs_cache_alloc(struct Objs_cache *cache)
       }
     }
   }
+
+  if (cache->ctor != NULL)
+    cache->ctor(allocated_obj);
   
   return allocated_obj;
 }

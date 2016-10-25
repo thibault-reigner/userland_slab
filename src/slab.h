@@ -46,6 +46,8 @@ struct Objs_cache{
 
   unsigned int flags;
 
+  void (*ctor)(void *);
+  
   struct Objs_cache *cache_slab_descr;
   
   unsigned int pages_per_slab;
@@ -73,11 +75,12 @@ void slab_allocator_destroy(void);
 
 struct Objs_cache * objs_cache_init(struct Objs_cache *cache,
 				    size_t obj_size,
-				    unsigned int pages_per_slab);
+				    void (*ctor)(void *));
 struct Objs_cache * _objs_cache_init(struct Objs_cache *cache,
 				     size_t obj_size,
 				     unsigned int pages_per_slab,
-				     unsigned int flags);
+				     unsigned int flags,
+				     void (*ctor)(void *));
 void objs_cache_destroy(struct Objs_cache *cache);
 void * objs_cache_alloc(struct Objs_cache *cache);
 void objs_cache_free(struct Objs_cache *cache, void *obj);

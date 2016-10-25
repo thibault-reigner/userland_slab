@@ -1,5 +1,5 @@
 C=gcc
-CFLAGS=-Wall -std=gnu11 -O0 -g
+CFLAGS=-Wall -std=gnu11 -O0 
 OFLAG=-O0 -flto
 VPATH=src
 OBJDIR=build
