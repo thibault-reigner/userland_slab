@@ -421,6 +421,7 @@ void *objs_cache_alloc(struct Objs_cache *cache)
 
 void objs_cache_free(struct Objs_cache *cache, void *obj)
 {
+  //TODO free some free slabs if necessary
   
   if (cache != NULL) {
     if (obj != NULL) {

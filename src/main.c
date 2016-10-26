@@ -34,7 +34,6 @@ int main(int argc, char **argv)
     
     for (int i = 0; i < N; i++){
       array[i] = malloc(sizeof(long));
-      *array[i] = i;
     }
     
     getchar();
