@@ -14,18 +14,25 @@ int main(int argc, char **argv)
 {
 
   /*You can compare the memory consumed by this program.
-    <program> <param>
-    <param> = 1 - malloc based allocation
-    <param> = 2 - slab based allocation
+    <program> <alloc_type> <size>
+    <alloc_type> = 1 - malloc based allocation
+    <alloc_type> = 2 - slab based allocation
+    <size> = size in bytes of the objects to allocate
   */
   
-  if (argc < 2)
+  if (argc < 3)
     return 0;
 
-  long *array[N];
-    
+  void *array[N];
+  size_t obj_size = strtol(argv[2], NULL, 10);
+
+  if ( !obj_size){
+    printf("The second parameter should be an unsigned integer (size in bytes of object).\n");
+    return -1;
+  }
+  
   if (argv[1][0] == '1'){
-    printf("Allocation of %d long integers with malloc()\n", N);
+    printf("Allocation of %d objects of size %lu with malloc()\n", N, obj_size);
 
     if (array == NULL){
       printf("Allocation failed\n");
@@ -33,13 +40,13 @@ int main(int argc, char **argv)
     }
     
     for (int i = 0; i < N; i++){
-      array[i] = malloc(sizeof(long));
+      array[i] = malloc(obj_size);
     }
     
     getchar();
   }
   else {  
-    printf("Allocation of %d long integers with the slab allocator\n", N);
+    printf("Allocation of %d objects of size %lu with the slab allocator\n", N, obj_size);
     
     struct Objs_cache cache;
 
@@ -49,9 +56,9 @@ int main(int argc, char **argv)
       exit(-1);
     }
 
-    //we initialise a cache to allocate objects of size sizeof(unsigned int)
+    //we initialise a cache to allocate objects of obj_size
 
-    if ( !objs_cache_init(&cache,sizeof(long), NULL)) {
+    if ( !objs_cache_init(&cache, obj_size, NULL)) {
       printf("Error : cache initialisation failed !\n");
       exit(-1);
     }

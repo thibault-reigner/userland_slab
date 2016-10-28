@@ -20,38 +20,38 @@ Allocation and desallocation of objects are also O(1). To be fair the worst case
 
 The slab allocator has to be initialised once and for all before use by calling :
 ```c
-int slab\_allocator\_init(void);
+int slab_allocator_init(void);
 ```
 
 Similarly, all the memory allocated by the slab allocator can be freed by calling :
 ```c
-void slab\_allocator\_destroy(void);
+void slab_allocator_destroy(void);
 ```
 
-Once the slab allocator is initialised, one can call use the following function to create a cache :
+Once the slab allocator is initialised, one can use the following function to create a cache for a specific kind of object:
 ```c
-struct Objs\_cache * objs\_cache\_init(struct Objs\_cache *cache,
-				    size_t obj\_size,
+struct Objs_cache * objs_cache_init(struct Objs_cache *cache,
+				    size_t obj_size,
 				    void (*ctor)(void *));
 ```
 
 Example to create a cache to allocate **unsigned long** integers:
 ```c
-struct Objs\_cache a_cache;
-objs\_cache\_init(&a\_cache, sizeof(unsigned long), NULL)
+struct Objs_cache a_cache;
+objs_cache_init(&a_cache, sizeof(unsigned long), NULL)
 ```
 
 Note one can specified a pointer to a constructor as third parameter to objs\_cache\_init(). This constructor function will be called during each object allocation, with the allocated object as parameter and allows a specific initialisation of object.
 
 One can allocate/free objects from a cache using the two following functions, whose behavior is similar to malloc()/free()
 ```c
-void * objs\_cache_alloc(struct Objs\_cache *cache);
-void objs\_cache\_free(struct Objs\_cache *cache, void *obj);
+void * objs_cache_alloc(struct Objs_cache *cache);
+void objs_cache_free(struct Objs_cache *cache, void *obj);
 ```
 
 Once a cache has become useless, all the memory used by it can be freed by calling :
 ```c
-void objs\_cache\_destroy(struct Objs\_cache *cache);
+void objs_cache_destroy(struct Objs_cache *cache);
 ```
 
 ## Example & benchmark
@@ -61,8 +61,38 @@ Set the parameter as 1 to allocate with malloc(), 2 with the slab allocator.
 
 Benchmark: 
 
-On Archlinux x86_64, gcc 6.2.1
-Allocation of 1000000 long integers with malloc() : 38 Mio
-Allocation of 1000000 long integers with slab allocator : 15.3 Mio
+On Archlinux x86_64, gcc 6.2.1<br>
+
+Comparison of the memory consummed by the program (as showed by top) by allocating 1,000,000 objects with malloc() and the slab allocator.
+
+|Size of an object in bytes|malloc()|slab allocator|
+|:--------------------------:|--------:|--------------:|
+| 8 | 38 Mio | 15.3 Mio|
+| 16 | 38 Mio | 23.0 Mio |
+| 32 | 53.4 Mio | 38.7 Mio |
+| 48 | 68.7 Mio | 54.0 Mio |
+| 64 | 83.9 Mio | 70.2 Mio |
+| 128 | 145.0 Mio | 135.2 Mio |
+| 256 | 266.9 Mio | 271.0 Mio |
+
+One can observe that for small objects, the slab allocator outcompetes the memory allocator of the C library because the last one consumes metadata for each allocated objects. But as the size of objects increases the slab-allocator starts to be less efficient, this is due to several reasons :
+
+specific to this implementation :
+* objects have to be contained within one page, when objects are big, a huge part of a page can be wasted.
+
+non-specific to this implementation :
+* the default slab size is 1 page (4096 bytes) 
+
+## Idea of improvement
+
+The main performance issue of the slab allocator in user space is to find to which slab belongs a given object (especially when it has to be freed). If the Linux kernel for instance uses a dedicated structure (the array of physical pages descriptors) to reverse map (virtual address) --> (slab), it is not possible to do this in the user space.
+
+There are at least two possible solutions to this problem :
+* add a header to each object which contains a pointer to the slab which contains this object. This is detrimental when objects are small, for instance on a 64 bits system, it would add 8 bytes to the actual size of an object.
+* add a pointer at the beginning of each page **(solution chosed for this implementation)** to the slab which owns this page. However objects have to be contained within one page which is detrimental for big objects.
+
+It would be possible to implement both behaviors based on the size of objects to allocate, but the function called to free objects then has to know the size of the object to free to choose what to do.
+
+
 
 
