@@ -91,8 +91,7 @@ There are at least two possible solutions to this problem :
 * add a header to each object which contains a pointer to the slab which contains this object. This is detrimental when objects are small, for instance on a 64 bits system, it would add 8 bytes to the actual size of an object.
 * add a pointer at the beginning of each page **(solution chosed for this implementation)** to the slab which owns this page. However objects have to be contained within one page which is detrimental for big objects.
 
-It would be possible to implement both behaviors based on the size of objects to allocate, but the function called to free objects then has to know the size of the object to free to choose what to do.
-
+It would be possible to implement both behaviors based on the size of objects to allocate.
 
 
 

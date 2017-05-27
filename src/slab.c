@@ -10,10 +10,11 @@
 #include "slab.h"
 #include "queue.h"
 
+#define DEFAULT_MAX_FREE_SLABS_ALLOWED 5
 
 #define ROUNDUP(x,align) ({ ((x/align) + (x % align ? 1UL : 0UL))*align;})
 #define ROUNDDOWN(x, align) ({ (x/align)*align;})
-
+#define MAX(a,b) (((a) > (b))? (a) : (b))
 
 static struct Obj * initialize_page_free_objs_list(void *pg,
 						   size_t pg_sz,
@@ -46,7 +47,6 @@ static struct Userland_slab * get_owning_slab(void *obj, size_t pg_sz);
 
 //cache used to allocate Userland_slab objects
 static struct Objs_cache cache_Userland_slab;
-
 
 /********************************************************
  *                       Private methods
@@ -116,10 +116,11 @@ static struct Userland_slab *create_slab(unsigned int pgs_per_slab,
   void *new_slab_pgs = mmap(NULL,
 			    slab_sz,
 			    PROT_READ | PROT_WRITE,
-			    MAP_PRIVATE | MAP_ANONYMOUS,
+			    MAP_PRIVATE | MAP_ANONYMOUS, 
 			    -1,
 			    0);
-
+  //NB: the pages don't have to be cleared since MAP_ANONYMOUS flag implies they are initialised to 0
+  
   if (new_slab_pgs == MAP_FAILED)
     return NULL;
 
@@ -139,9 +140,6 @@ static struct Userland_slab *create_slab(unsigned int pgs_per_slab,
   }
 
   new_slab_descr->pages = new_slab_pgs;
-  
-  //TODO : check if clearing the slab is necessary
-  memset(new_slab_pgs, 0, slab_sz);
   
   //At the beginning of each page we define a pointer to the slab descriptor to which this page belongs
   struct Userland_slab **ptr = new_slab_pgs;
@@ -216,6 +214,16 @@ static void free_obj_from_slab(struct Userland_slab *slab, struct Obj *obj)
   slab->first_free_obj = obj;
 }
 
+static void default_slab_freeing_policy(struct Objs_cache *cache)
+{
+  if (cache != NULL) {
+    struct Userland_slab *slab = cache->free_slabs;
+    for (;cache->free_slabs_count > DEFAULT_MAX_FREE_SLABS_ALLOWED; cache->free_slabs_count--) {
+      slab = dlist_pop_head_generic(cache->free_slabs, prev, next);
+      destroy_slab(slab, cache->slab_size);
+    }
+  }
+}
 
 /********************************************************
  *                       Public methods
@@ -228,6 +236,7 @@ int slab_allocator_init(void)
 					    sizeof(struct Userland_slab),
 					    CACHE_USERLAND_SLAB_PAGES_PER_SLAB,
 					    SLAB_DESCR_ON_SLAB,
+					    NULL,
 					    NULL);
   return (ptr != NULL);
 }
@@ -250,14 +259,16 @@ struct Objs_cache * objs_cache_init(struct Objs_cache *cache,
 			  obj_size,
 			  1,
 			  0,
-			  ctor);
+			  ctor,
+			  NULL);
 }
 
 struct Objs_cache * _objs_cache_init(struct Objs_cache *cache,
 				     size_t obj_size,
 				     unsigned int pages_per_slab,
 				     unsigned int flags,
-				     void (*ctor)(void *))
+				     void (*ctor)(void *),
+				     void (*slab_freeing_policy)(struct Objs_cache*))
 {
 
   if (cache == NULL || pages_per_slab == 0)
@@ -266,10 +277,17 @@ struct Objs_cache * _objs_cache_init(struct Objs_cache *cache,
   cache->obj_size = obj_size;
   //when an object is free, its bytes are used as a pointer to the next free object
   //so an object has to be at least the big enough to store this pointer
-  cache->actual_obj_size = (obj_size >= sizeof(void*) ? obj_size : sizeof(void*));
+  cache->actual_obj_size = MAX(obj_size, sizeof(void*));
   cache->flags = flags;
   cache->ctor = ctor;
-  cache->cache_slab_descr = &cache_Userland_slab;
+
+  if (slab_freeing_policy == NULL)
+    cache->slab_freeing_policy = default_slab_freeing_policy;
+  else
+    cache->slab_freeing_policy = slab_freeing_policy;
+  
+  if ( !(flags & SLAB_DESCR_ON_SLAB))
+    cache->cache_slab_descr = &cache_Userland_slab;
       
   cache->pages_per_slab = pages_per_slab;
   cache->page_size = sysconf(_SC_PAGESIZE);
@@ -392,7 +410,7 @@ void *objs_cache_alloc(struct Objs_cache *cache)
       cache->free_objs_count--;
       cache->used_objs_count++;
 
-      if (!is_slab_full(slab)) {
+      if ( !is_slab_full(slab)) {
 	//the slab is at least partially used but not full
 	    
 	dlist_delete_head_generic(cache->free_slabs, slab, prev, next);
@@ -421,53 +439,53 @@ void *objs_cache_alloc(struct Objs_cache *cache)
 
 void objs_cache_free(struct Objs_cache *cache, void *obj)
 {
-  //TODO free some free slabs if necessary
   
-  if (cache != NULL) {
-    if (obj != NULL) {
-      struct Userland_slab *slab = get_owning_slab(obj, cache->page_size);
+  if (cache != NULL && obj != NULL) {
+    struct Userland_slab *slab = get_owning_slab(obj, cache->page_size);
 
-      if (slab == NULL) {
-	printf("Failed to free an object in %s (slab corrupted) !\n", __func__);
-      }
+    if (slab == NULL) {
+      printf("Failed to free an object in %s (slab corrupted) !\n", __func__);
+    }
 
-      char slab_was_full = is_slab_full(slab);
-      free_obj_from_slab(slab, obj);
-      char slab_is_now_free = is_slab_empty(slab, cache->objs_per_slab);
+    char slab_was_full = is_slab_full(slab);
+    free_obj_from_slab(slab, obj);
+    char slab_is_now_free = is_slab_empty(slab, cache->objs_per_slab);
 
-      cache->free_objs_count++;
-      cache->used_objs_count--;
+    cache->free_objs_count++;
+    cache->used_objs_count--;
 	  
-      /*We have 3 possible change of state for the slab :
-	full    -> partial
-	full    -> free (case where a slab contains 1 object)
-	partial -> free
-      */
+    /*We have 3 possible change of state for the slab :
+      full    -> partial
+      full    -> free (case where a slab contains 1 object)
+      partial -> free
+    */
 
-      if ( !slab_was_full && slab_is_now_free) {
-	//partial -> free
-	dlist_delete_el_generic(cache->partial_slabs, slab, prev, next);
+    if ( !slab_was_full && slab_is_now_free) {
+      //partial -> free
+      dlist_delete_el_generic(cache->partial_slabs, slab, prev, next);
+      dlist_push_head_generic(cache->free_slabs, slab, prev, next);
+      cache->partial_slabs_count--;
+      cache->free_slabs_count++;
+    }
+    else if (slab_was_full) {
+      if ( !slab_is_now_free) {
+	//full -> partial
+	dlist_delete_el_generic(cache->full_slabs, slab, prev, next);
+	dlist_push_head_generic(cache->partial_slabs, slab, prev, next);
+	cache->full_slabs_count--;
+	cache->partial_slabs_count++;
+      }
+      else {
+	//full -> free
+	dlist_delete_el_generic(cache->full_slabs, slab, prev, next);
 	dlist_push_head_generic(cache->free_slabs, slab, prev, next);
-	cache->partial_slabs_count--;
+	cache->full_slabs_count--;
 	cache->free_slabs_count++;
       }
-      else if (slab_was_full) {
-	if ( !slab_is_now_free) {
-	  //full -> partial
-	  dlist_delete_el_generic(cache->full_slabs, slab, prev, next);
-	  dlist_push_head_generic(cache->partial_slabs, slab, prev, next);
-	  cache->full_slabs_count--;
-	  cache->partial_slabs_count++;
-	}
-	else {
-	  //full -> free
-	  dlist_delete_el_generic(cache->full_slabs, slab, prev, next);
-	  dlist_push_head_generic(cache->free_slabs, slab, prev, next);
-	  cache->full_slabs_count--;
-	  cache->free_slabs_count++;
-	}
-      } 
     }
+
+    // Try to free some slabs
+    cache->slab_freeing_policy(cache);
   }
   else {
     printf("Error : cache NULL as parameter for %s\n", __func__);
@@ -481,40 +499,44 @@ void objs_cache_free(struct Objs_cache *cache, void *obj)
 
 void display_cache_info(const struct Objs_cache *cache)
 {
-  printf("\ndisplay_cache_info()\n" \
-	 "obj_size : %lu\n" \
-	 "actual_obj_size : %lu\n" \
-	 "flags : %u\n" \
-	 "pages_per_slab : %u\n" \
-	 "slab_size : %lu\n" \
-	 "objs_per_slab : %u\n" \
-	 "wasted_memory_per_slab : %lu\n"\
-	 "free_objs_count : %u\n" \
-	 "used_objs_count : %u\n" \
-	 "slab_count : %u\n" \
-	 "free_slabs_count : %u\n" \
-	 "partial_slabs_count : %u\n" \
-	 "full_slabs_count : %u\n",
-	 cache->obj_size,
-	 cache->actual_obj_size,
-	 cache->flags,
-	 cache->pages_per_slab,
-	 cache->slab_size,
-	 cache->objs_per_slab,
-	 cache->wasted_memory_per_slab,
-	 cache->free_objs_count,
-	 cache->used_objs_count,
-	 cache->slab_count,
-	 cache->free_slabs_count,
-	 cache->partial_slabs_count,
-	 cache->full_slabs_count);
-  printf("\n");
+  if (cache != NULL) {
+    printf("\ndisplay_cache_info()\n" \
+	   "obj_size : %lu\n" \
+	   "actual_obj_size : %lu\n" \
+	   "flags : %u\n" \
+	   "pages_per_slab : %u\n" \
+	   "slab_size : %lu\n" \
+	   "objs_per_slab : %u\n" \
+	   "wasted_memory_per_slab : %lu\n"\
+	   "free_objs_count : %u\n" \
+	   "used_objs_count : %u\n" \
+	   "slab_count : %u\n" \
+	   "free_slabs_count : %u\n" \
+	   "partial_slabs_count : %u\n" \
+	   "full_slabs_count : %u\n",
+	   cache->obj_size,
+	   cache->actual_obj_size,
+	   cache->flags,
+	   cache->pages_per_slab,
+	   cache->slab_size,
+	   cache->objs_per_slab,
+	   cache->wasted_memory_per_slab,
+	   cache->free_objs_count,
+	   cache->used_objs_count,
+	   cache->slab_count,
+	   cache->free_slabs_count,
+	   cache->partial_slabs_count,
+	   cache->full_slabs_count);
+    printf("\n");
+  }
 }
 
 void display_slab_info(const struct Userland_slab *slab)
 {
-  printf("\ndisplay_slab_info()\n"\
-	 "free_objs_count : %u\n",slab->free_objs_count);
-  printf("\n");
+  if (slab != NULL) {
+    printf("\ndisplay_slab_info()\n"\
+	   "free_objs_count : %u\n",slab->free_objs_count);
+    printf("\n");
+  }
 }
 

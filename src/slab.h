@@ -47,6 +47,8 @@ struct Objs_cache{
   unsigned int flags;
 
   void (*ctor)(void *);
+
+  void (*slab_freeing_policy)(struct Objs_cache *);
   
   struct Objs_cache *cache_slab_descr;
   
@@ -80,7 +82,8 @@ struct Objs_cache * _objs_cache_init(struct Objs_cache *cache,
 				     size_t obj_size,
 				     unsigned int pages_per_slab,
 				     unsigned int flags,
-				     void (*ctor)(void *));
+				     void (*ctor)(void *),
+				     void (*slab_freeing_policy)(struct Objs_cache*));
 void objs_cache_destroy(struct Objs_cache *cache);
 void * objs_cache_alloc(struct Objs_cache *cache);
 void objs_cache_free(struct Objs_cache *cache, void *obj);

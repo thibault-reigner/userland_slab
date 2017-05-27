@@ -39,7 +39,7 @@
 
 #define dlist_pop_head_generic(list, prev, next) ({	\
       typeof(list) __el2pop = (list);			\
-      dlist_delete_head_generic(list, __el2pop, next);	\
+      dlist_delete_head_generic(list, __el2pop, prev, next);	\
       __el2pop;						\
     })
 

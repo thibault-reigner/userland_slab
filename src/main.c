@@ -21,7 +21,14 @@ int main(int argc, char **argv)
   */
   
   if (argc < 3)
-    return 0;
+    {
+      printf("Arguments expected !\n"\
+	     "program <alloc_type> <size>\n"\
+	     "<alloc_type> = 1 - malloc based allocation\n"\
+	     "<alloc_type> = 2 - slab based allocation\n"\
+	     "<size> = size in bytes of the objects to allocate\n");
+      return 0;
+    }
 
   void *array[N];
   size_t obj_size = strtol(argv[2], NULL, 10);
