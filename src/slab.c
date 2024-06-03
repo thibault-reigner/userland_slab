@@ -171,7 +171,8 @@ static struct Userland_slab *create_slab(unsigned int pgs_per_slab,
 					      obj_sz);
     if (i < pgs_per_slab) {
       pg = (void*)((uintptr_t)pg + pg_sz);
-      current_obj = (struct Obj*)((uintptr_t)pg + pg_metadata_sz);
+      //current_obj = (struct Obj*)((uintptr_t)pg + pg_metadata_sz);
+      current_obj = (struct Obj*)((uintptr_t)pg + pg_metadata_sz + (on_slab_descriptor ? sizeof(struct Userland_slab) : 0));
       last_obj->header.if_free.next = current_obj;
     }
   }
@@ -297,7 +298,8 @@ struct Objs_cache * _objs_cache_init(struct Objs_cache *cache,
   unsigned int free_objs_first_pg = (cache->page_size - pg_metadata_sz - (flags & SLAB_DESCR_ON_SLAB ? sizeof(struct Userland_slab) : 0)) / cache->actual_obj_size;
   unsigned int free_objs_pg = (cache->page_size - pg_metadata_sz) / cache->actual_obj_size;
   
-  cache->objs_per_slab = free_objs_pg + free_objs_first_pg * (cache->pages_per_slab - 1);;
+  //cache->objs_per_slab = free_objs_pg + free_objs_first_pg * (cache->pages_per_slab - 1);;
+  cache->objs_per_slab = free_objs_first_pg + free_objs_pg * (cache->pages_per_slab - 1);
 
   cache->wasted_memory_per_page = cache->page_size % cache->actual_obj_size;
   cache->wasted_memory_per_slab = cache->wasted_memory_per_page * cache->pages_per_slab;
