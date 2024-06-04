@@ -171,8 +171,7 @@ static struct Userland_slab *create_slab(unsigned int pgs_per_slab,
 					      obj_sz);
     if (i < pgs_per_slab) {
       pg = (void*)((uintptr_t)pg + pg_sz);
-      //current_obj = (struct Obj*)((uintptr_t)pg + pg_metadata_sz);
-      current_obj = (struct Obj*)((uintptr_t)pg + pg_metadata_sz + (on_slab_descriptor ? sizeof(struct Userland_slab) : 0));
+      current_obj = (struct Obj*)((uintptr_t)pg + pg_metadata_sz);
       last_obj->header.if_free.next = current_obj;
     }
   }
