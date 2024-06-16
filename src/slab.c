@@ -297,7 +297,8 @@ struct Objs_cache * _objs_cache_init(struct Objs_cache *cache,
   unsigned int free_objs_first_pg = (cache->page_size - pg_metadata_sz - (flags & SLAB_DESCR_ON_SLAB ? sizeof(struct Userland_slab) : 0)) / cache->actual_obj_size;
   unsigned int free_objs_pg = (cache->page_size - pg_metadata_sz) / cache->actual_obj_size;
   
-  cache->objs_per_slab = free_objs_pg + free_objs_first_pg * (cache->pages_per_slab - 1);;
+  //cache->objs_per_slab = free_objs_pg + free_objs_first_pg * (cache->pages_per_slab - 1);;
+  cache->objs_per_slab = free_objs_first_pg + free_objs_pg * (cache->pages_per_slab - 1);
 
   cache->wasted_memory_per_page = cache->page_size % cache->actual_obj_size;
   cache->wasted_memory_per_slab = cache->wasted_memory_per_page * cache->pages_per_slab;
